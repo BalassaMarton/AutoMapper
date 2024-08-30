@@ -1,5 +1,7 @@
 using System.Collections;
+using System.Collections.Immutable;
 using System.Dynamic;
+using System.Reflection;
 namespace AutoMapper.Internal;
 public static class TypeExtensions
 {
@@ -47,7 +49,7 @@ public static class TypeExtensions
     public static FieldInfo GetInheritedField(this Type type, string name) => type.GetField(name, InstanceFlags) ?? type.GetBaseField(name);
     static FieldInfo GetBaseField(this Type type, string name) =>
         type.BaseClassesAndInterfaces().Select(t => t.GetField(name, InstanceFlags)).FirstOrDefault(f => f != null);
-    public static MethodInfo GetInheritedMethod(this Type type, string name) => type.GetInstanceMethod(name) ?? type.GetBaseMethod(name) ?? 
+    public static MethodInfo GetInheritedMethod(this Type type, string name) => type.GetInstanceMethod(name) ?? type.GetBaseMethod(name) ??
         throw new ArgumentOutOfRangeException(nameof(name), $"Cannot find member {name} of type {type}.");
     static MethodInfo GetBaseMethod(this Type type, string name) =>
         type.BaseClassesAndInterfaces().Select(t => t.GetInstanceMethod(name)).FirstOrDefault(m => m != null);
@@ -60,6 +62,22 @@ public static class TypeExtensions
     public static Type GetICollectionType(this Type type) => type.GetGenericInterface(typeof(ICollection<>));
 
     public static bool IsCollection(this Type type) => type != typeof(string) && typeof(IEnumerable).IsAssignableFrom(type);
+
+    public static bool IsImmutableCollection(this Type type)
+    {
+        return
+            type.IsGenericType(typeof(ImmutableArray<>))
+            || type.IsGenericType(typeof(IImmutableList<>))
+            || type.IsGenericType(typeof(ImmutableList<>))
+            || type.IsGenericType(typeof(IImmutableSet<>))
+            || type.IsGenericType(typeof(ImmutableHashSet<>))
+            || type.IsGenericType(typeof(IImmutableQueue<>))
+            || type.IsGenericType(typeof(ImmutableQueue<>))
+            || type.IsGenericType(typeof(IImmutableStack<>))
+            || type.IsGenericType(typeof(ImmutableStack<>))
+            || type.IsGenericType(typeof(IImmutableDictionary<,>))
+            || type.IsGenericType(typeof(ImmutableDictionary<,>));
+    }
 
     public static bool IsListType(this Type type) => typeof(IList).IsAssignableFrom(type);
 
@@ -101,4 +119,48 @@ public static class TypeExtensions
     public static MethodInfo GetStaticMethod(this Type type, string name) => type.GetMethod(name, StaticFlags);
     public static MethodInfo GetInstanceMethod(this Type type, string name) =>
         (MethodInfo)type.GetMember(name, MemberTypes.Method, InstanceFlags).FirstOrDefault();
+
+    public static MethodInfo GetGenericMethodDefinition<TArg, TResult>(Expression<Func<TArg, TResult>> expr)
+    {
+        if (expr.Body is MethodCallExpression methodCall
+            && methodCall.Method.IsGenericMethod)
+        {
+            return methodCall.Method.GetGenericMethodDefinition();
+        }
+
+        throw new ArgumentOutOfRangeException(nameof(expr), $"Cannot find the generic method definition for expression '{expr}'");
+    }
+
+    public static MethodInfo GetGenericMethodDefinition<TResult>(Expression<Func<TResult>> expr)
+    {
+        if (expr.Body is MethodCallExpression methodCall
+            && methodCall.Method.IsGenericMethod)
+        {
+            return methodCall.Method.GetGenericMethodDefinition();
+        }
+
+        throw new ArgumentOutOfRangeException(nameof(expr), $"Cannot find the generic method definition for expression '{expr}'");
+    }
+
+    public static MemberInfo GetMemberOfGenericTypeDefinition<TResult>(Expression<Func<TResult>> expr)
+    {
+        if (expr.Body is MemberExpression memberExpression
+            && memberExpression.Member.DeclaringType.IsGenericType)
+        {
+            var member = memberExpression.Member.DeclaringType.GetGenericTypeDefinition()
+                .GetMember(memberExpression.Member.Name)
+                .FirstOrDefault(m => m.HasSameMetadataDefinitionAs(memberExpression.Member));
+
+            if (member is not null) return member;
+        }
+
+        throw new ArgumentOutOfRangeException(nameof(expr), $"Cannot find the generic member for expression '{expr}'");
+    }
+
+    public static MemberInfo GetMemberOfClosedGenericType(this Type closedGenericType, MemberInfo genericMember)
+    {
+        return closedGenericType.GetMember(genericMember.Name, genericMember.MemberType, BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static)
+            .FirstOrDefault(m => m.HasSameMetadataDefinitionAs(genericMember))
+        ?? throw new ArgumentOutOfRangeException(nameof(genericMember), $"Cannot find member '{genericMember.Name}' of type '{closedGenericType.FullName}'");
+    }
 }

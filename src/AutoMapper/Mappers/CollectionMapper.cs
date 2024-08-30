@@ -1,4 +1,5 @@
 using System.Collections;
+using System.Collections.Immutable;
 using System.Collections.ObjectModel;
 using System.Collections.Specialized;
 namespace AutoMapper.Internal.Mappers;
@@ -11,23 +12,34 @@ public class CollectionMapper : IObjectMapper
     public Expression MapExpression(IGlobalConfiguration configuration, ProfileMap profileMap, MemberMap memberMap, Expression sourceExpression, Expression destExpression)
     {
         var destinationType = destExpression.Type;
+        
         if (destinationType.IsArray)
         {
             return ArrayMapper.MapToArray(configuration, profileMap, sourceExpression, destinationType);
         }
+
         if (destinationType.IsGenericType(typeof(ReadOnlyCollection<>)))
         {
             return MapReadOnlyCollection(typeof(List<>), typeof(ReadOnlyCollection<>));
         }
+
         if (destinationType.IsGenericType(typeof(ReadOnlyDictionary<,>)) || destinationType.IsGenericType(typeof(IReadOnlyDictionary<,>)))
         {
             return MapReadOnlyCollection(typeof(Dictionary<,>), typeof(ReadOnlyDictionary<,>));
         }
+
         if (destinationType == sourceExpression.Type && destinationType.Name == nameof(NameValueCollection))
         {
             return CreateNameValueCollection(sourceExpression);
         }
+        
+        if (destinationType.IsImmutableCollection())
+        {
+            return ImmutableCollectionMapper.MapToImmutableCollection(configuration, profileMap, sourceExpression, destinationType);
+        }
+
         return MapCollectionCore(destExpression);
+
         Expression MapReadOnlyCollection(Type genericCollectionType, Type genericReadOnlyCollectionType)
         {
             var destinationTypeArguments = destinationType.GenericTypeArguments;
@@ -36,6 +48,7 @@ public class CollectionMapper : IObjectMapper
             var readOnlyClosedType = destinationType.IsInterface ? genericReadOnlyCollectionType.MakeGenericType(destinationTypeArguments) : destinationType;
             return New(readOnlyClosedType.GetConstructors()[0], dict);
         }
+
         Expression MapCollectionCore(Expression destExpression)
         {
             var destinationType = destExpression.Type;
@@ -49,8 +62,8 @@ public class CollectionMapper : IObjectMapper
             var sourceElementType = GetEnumerableElementType(sourceType);
             if (destinationCollectionType == null || (sourceType == sourceElementType && destinationType == destinationElementType))
             {
-                return destinationType.IsAssignableFrom(sourceType) ? 
-                            sourceExpression : 
+                return destinationType.IsAssignableFrom(sourceType) ?
+                            sourceExpression :
                             Throw(Constant(new NotSupportedException($"Unknown collection. Consider a custom type converter from {sourceType} to {destinationType}.")), destinationType);
             }
             var itemParam = Parameter(sourceElementType, "item");
@@ -234,11 +247,89 @@ public class CollectionMapper : IObjectMapper
                 }
                 return Call(ToArrayMethod.MakeGenericMethod(sourceElementType), sourceExpression);
             }
-            bool MustMap(Type sourceType, Type destinationType) => !destinationType.IsAssignableFrom(sourceType) || 
+            bool MustMap(Type sourceType, Type destinationType) => !destinationType.IsAssignableFrom(sourceType) ||
                 configuration.FindTypeMapFor(sourceType, destinationType) != null;
         }
     }
+
+    static class ImmutableCollectionMapper
+    {
+        private static readonly MethodInfo ToImmutableArrayMethod = TypeExtensions.GetGenericMethodDefinition((IEnumerable<object> x) => x.ToImmutableArray());
+        private static readonly MethodInfo ToImmutableListMethod = TypeExtensions.GetGenericMethodDefinition((IEnumerable<object> x) => x.ToImmutableList());
+        private static readonly MethodInfo ToImmutableHashSetMethod = TypeExtensions.GetGenericMethodDefinition((IEnumerable<object> x) => x.ToImmutableHashSet());
+        private static readonly MethodInfo CreateImmutableQueueMethod = TypeExtensions.GetGenericMethodDefinition((IEnumerable<object> x) => ImmutableQueue.CreateRange(x));
+        private static readonly MethodInfo CreateImmutableStackMethod = TypeExtensions.GetGenericMethodDefinition((IEnumerable<object> x) => ImmutableStack.CreateRange(x));
+        private static readonly MethodInfo ToImmutableDictionaryMethod = TypeExtensions.GetGenericMethodDefinition((IEnumerable<KeyValuePair<object, object>> x) => x.ToImmutableDictionary());
+
+        public static Expression MapToImmutableCollection(IGlobalConfiguration configuration, ProfileMap profileMap, Expression sourceExpression, Type destinationType)
+        {
+            var destinationElementType = destinationType.GetIEnumerableType().GenericTypeArguments[0];
+            var sourceType = sourceExpression.Type;
+            var factoryMethod = FindDestinationFactoryMethod();
+
+            var mapFromIEnumerable = MapFromIEnumerable();
+            
+            if (mapFromIEnumerable != null)
+            {
+                return mapFromIEnumerable;
+            }
+
+            var mappedSource = configuration.MapExpression(
+                profileMap,
+                new(sourceType, typeof(IEnumerable<>).MakeGenericType(destinationElementType)),
+                sourceExpression);
+
+            return Call(MakeGenericFactoryMethod(factoryMethod, destinationElementType), mappedSource);
+            
+            Expression MapFromIEnumerable()
+            {
+                var iEnumerableType = sourceType.GetIEnumerableType();
+                var sourceElementType = iEnumerableType.GetGenericArguments()[0];
+
+                if (iEnumerableType == null || MustMap(sourceElementType, destinationElementType))
+                {
+                    return null;
+                }
+
+                return Call(MakeGenericFactoryMethod(factoryMethod, sourceElementType), ToType(sourceExpression, iEnumerableType));
+            }
+
+            bool MustMap(Type sourceType, Type destinationType) => !destinationType.IsAssignableFrom(sourceType) ||
+                configuration.FindTypeMapFor(sourceType, destinationType) != null;
+
+            MethodInfo FindDestinationFactoryMethod()
+            {
+                if (destinationType.IsGenericType(typeof(ImmutableArray<>)))
+                    return ToImmutableArrayMethod;
+
+                if (destinationType.IsGenericType(typeof(IImmutableList<>)) || destinationType.IsGenericType(typeof(ImmutableList<>)))
+                    return ToImmutableListMethod;
+
+                if (destinationType.IsGenericType(typeof(IImmutableSet<>)) || destinationType.IsGenericType(typeof(ImmutableHashSet<>)))
+                    return ToImmutableHashSetMethod;
+
+                if (destinationType.IsGenericType(typeof(IImmutableQueue<>)) || destinationType.IsGenericType(typeof(ImmutableQueue<>)))
+                    return CreateImmutableQueueMethod;
+
+                if (destinationType.IsGenericType(typeof(IImmutableStack<>)) || destinationType.IsGenericType(typeof(ImmutableStack<>)))
+                    return CreateImmutableStackMethod;
+
+                if (destinationType.IsGenericType(typeof(IImmutableDictionary<,>)) || destinationType.IsGenericType(typeof(ImmutableDictionary<,>)))
+                    return ToImmutableDictionaryMethod;
+
+                throw new NotSupportedException($"The destination type {destinationType.FullName} is not supported");
+            }   
+
+            MethodInfo MakeGenericFactoryMethod(MethodInfo factoryMethod, Type destinationElementType)
+            {
+                return destinationElementType.IsGenericType(typeof(KeyValuePair<,>))
+                    ? factoryMethod.MakeGenericMethod(destinationElementType.GetGenericArguments())
+                    : factoryMethod.MakeGenericMethod(destinationElementType);
+            }
+        }
+    }
 }
+
 public readonly struct MultidimensionalArrayFiller(Array destination)
 {
     private readonly int[] _indices = new int[destination.Rank];
